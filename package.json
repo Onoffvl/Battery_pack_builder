@@ -1,0 +1,22 @@
+{
+  "name": "battery-pack-designer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Visual series/parallel battery pack designer with a real electrical topology engine",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8"
+  }
+}
