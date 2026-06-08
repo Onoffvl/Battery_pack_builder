@@ -194,6 +194,10 @@ body {
 .tap-name { font-weight: 600; color: #6a1b9a; width: 32px; }
 .tap-v { margin-left: auto; color: #555; font-variant-numeric: tabular-nums; }
 
+.dim-row { display: flex; gap: 8px; margin-bottom: 0.5rem; }
+.dim-row .field { flex: 1; margin-bottom: 0; }
+.dim-row .field label { font-size: 11px; }
+
 .bom { border-collapse: collapse; width: 100%; }
 .bom td { border: 1px solid #e3e6ea; padding: 6px 12px; font-size: 13px; }
 .bom td:first-child { width: 48px; }

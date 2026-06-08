@@ -112,12 +112,50 @@ export function analyzePack(cells, connections) {
   const energy = cells.reduce((s, c) => s + c.voltage * c.capacity, 0);
 
   const nets = new Set();
+  const netSize = new Map();
   cells.forEach((c) => {
-    nets.add(uf.find(term(c.id, '+')));
-    nets.add(uf.find(term(c.id, '-')));
+    ['+', '-'].forEach((pole) => {
+      const n = uf.find(term(c.id, pole));
+      nets.add(n);
+      netSize.set(n, (netSize.get(n) || 0) + 1);
+    });
   });
 
-  const label = main.uniform && main.series > 0 ? `${main.series}S${main.parallel}P` : null;
+  // The pack's two output terminals (B+/B−) are open by design — don't flag
+  // those. Collect them from every reduced component.
+  const outNets = new Set();
+  components.forEach((comp) => (comp.outNets || []).forEach((n) => outNets.add(n)));
+
+  // A terminal alone on its net, that isn't a pack output, is a missed weld —
+  // flag it when the cell's *other* terminal is connected.
+  if (cells.length > 1) {
+    cells.forEach((c) => {
+      const pNet = uf.find(term(c.id, '+'));
+      const nNet = uf.find(term(c.id, '-'));
+      const pAlone = netSize.get(pNet) === 1 && !outNets.has(pNet);
+      const nAlone = netSize.get(nNet) === 1 && !outNets.has(nNet);
+      if (pAlone && !nAlone) {
+        faults.push({ type: 'open-terminal', severity: 'warn', cellIds: [c.id],
+          message: `Cell ${c.id}'s + terminal isn't connected to anything.` });
+      } else if (nAlone && !pAlone) {
+        faults.push({ type: 'open-terminal', severity: 'warn', cellIds: [c.id],
+          message: `Cell ${c.id}'s − terminal isn't connected to anything.` });
+      }
+    });
+  }
+
+  // Only label a clean, uniform S×P pack. If series × parallel doesn't account
+  // for every cell, the wiring is irregular — don't print a misleading config.
+  const reversedSeries = faults.some((f) => f.type === 'reversed-series');
+  const clean = main.uniform && main.series > 0 && main.series * main.parallel === main.cellCount && !reversedSeries;
+  const label = clean ? `${main.series}S${main.parallel}P` : null;
+
+  // One verdict the UI can trust: a valid pack is a single connected group that
+  // reduced to a real series/parallel result with no errors or open terminals.
+  const hasError = faults.some((f) => f.severity === 'error');
+  const hasOpen = faults.some((f) => f.type === 'open-terminal');
+  const nonSP = faults.some((f) => f.type === 'non-sp');
+  const valid = cells.length > 0 && components.length === 1 && main.series > 0 && !hasError && !hasOpen && !nonSP;
 
   return {
     voltage: main.voltage,
@@ -127,6 +165,7 @@ export function analyzePack(cells, connections) {
     parallel: main.parallel,
     label,
     uniform: main.uniform,
+    valid,
     cellCount: cells.length,
     connectionCount: connections.length,
     netCount: nets.size,
@@ -250,8 +289,10 @@ export function computeNets(cells, connections) {
 // Collapse one connected component down to a single equivalent edge.
 function reduceComponent(cellsIn, faults) {
   // edge.v = potential(to) − potential(from); we keep edges oriented − → +.
+  // vAligned tracks what the voltage *would* be if every series step added up;
+  // if the final |v| falls short, some cell/group is reversed and cancelling.
   let edges = cellsIn.map((c) => ({
-    from: c.neg, to: c.pos, v: c.voltage, cap: c.capacity,
+    from: c.neg, to: c.pos, v: c.voltage, cap: c.capacity, vAligned: c.voltage,
     cellIds: [c.id], series: 1, parallel: 1,
   }));
 
@@ -259,6 +300,19 @@ function reduceComponent(cellsIn, faults) {
   const uniform = cellsIn.every(
     (c) => Math.abs(c.voltage - first.voltage) < EPS && Math.abs(c.capacity - first.capacity) < EPS
   );
+
+  // The pack's output terminals (B+ / B−) are the highest- and lowest-potential
+  // nets. We must NEVER series-merge through them — otherwise parallel strings
+  // that meet only at the rails (a loop) get collapsed the wrong way and cancel.
+  const pot0 = potentials(edges);
+  let hiTerm = null;
+  let loTerm = null;
+  let hiP = -Infinity;
+  let loP = Infinity;
+  pot0.forEach((p, net) => {
+    if (p > hiP) { hiP = p; hiTerm = net; }
+    if (p < loP) { loP = p; loTerm = net; }
+  });
 
   let changed = true;
   let guard = 0;
@@ -289,7 +343,7 @@ function reduceComponent(cellsIn, faults) {
         }
 
         edges[i] = {
-          from: a.from, to: a.to, v: a.v, cap: a.cap + b.cap,
+          from: a.from, to: a.to, v: a.v, cap: a.cap + b.cap, vAligned: a.vAligned,
           cellIds: [...a.cellIds, ...b.cellIds],
           series: a.series, parallel: a.parallel + b.parallel,
         };
@@ -308,6 +362,7 @@ function reduceComponent(cellsIn, faults) {
     });
     for (const [net, d] of deg) {
       if (d !== 2) continue;
+      if (net === hiTerm || net === loTerm) continue; // never merge through B+/B−
       const inc = [];
       edges.forEach((e, idx) => {
         if (e.from === net || e.to === net) inc.push(idx);
@@ -323,6 +378,7 @@ function reduceComponent(cellsIn, faults) {
       const merged = {
         from: x, to: y, v: v1 + v2,
         cap: Math.min(e1.cap, e2.cap),
+        vAligned: e1.vAligned + e2.vAligned,
         cellIds: [...e1.cellIds, ...e2.cellIds],
         series: e1.series + e2.series,
         parallel: Math.max(e1.parallel, e2.parallel),
@@ -335,13 +391,22 @@ function reduceComponent(cellsIn, faults) {
   }
 
   if (edges.length === 1) {
+    const e = edges[0];
+    const actual = Math.abs(e.v);
+    if (actual < e.vAligned - EPS) {
+      faults.push({
+        type: 'reversed-series', severity: 'error', cellIds: cellsIn.map((c) => c.id),
+        message: `A cell or group is reversed in the series string — voltages cancel (expected ${e.vAligned.toFixed(1)}V, got ${actual.toFixed(1)}V).`,
+      });
+    }
     return {
-      voltage: Math.abs(edges[0].v),
-      capacity: edges[0].cap,
-      series: edges[0].series,
-      parallel: edges[0].parallel,
+      voltage: actual,
+      capacity: e.cap,
+      series: e.series,
+      parallel: e.parallel,
       cellCount: cellsIn.length,
       uniform,
+      outNets: [e.from, e.to], // the pack's B+ / B− terminals (open by design)
     };
   }
 

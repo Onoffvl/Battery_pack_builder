@@ -1,28 +1,39 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { analyzePack, computeBMSTaps, computeNets } from './topology.js';
+import { analyzePack, computeBMSTaps } from './topology.js';
 
 const CELL_W = 60;
 const CELL_H = 90;
 const NODE_R = 7;
 const NODE_GAP = 14; // distance from a cell edge to its terminal node centre
 
+// Shared grid for placement + drag snapping (origin and spacing).
+const GRID_OX = 50;
+const GRID_OY = 50;
+const GRID_SX = 95;
+const GRID_SY = 150;
+const snapToGrid = (v, step, origin) => origin + Math.round((v - origin) / step) * step;
+
 const CHEMISTRIES = [
   { id: 'liion', name: 'Li-ion (NMC)', voltage: 3.7 },
-  { id: 'lifepo4', name: 'LiFePO₄', voltage: 3.2 },
   { id: 'lipo', name: 'LiPo', voltage: 3.7 },
-  { id: 'nimh', name: 'NiMH', voltage: 1.2 },
+  { id: 'lifepo4', name: 'LiFePO₄', voltage: 3.2 },
+  { id: 'lto', name: 'Li-titanate (LTO)', voltage: 2.4 },
+  { id: 'nmh', name: 'NiMH', voltage: 1.2 },
+  { id: 'nicd', name: 'NiCd', voltage: 1.2 },
+  { id: 'alkaline', name: 'Alkaline', voltage: 1.5 },
   { id: 'lead', name: 'Lead-acid', voltage: 2.0 },
 ];
+// w/h are the physical footprint in mm (diameter × length for cylindrical).
 const CELL_SIZES = [
-  { name: '18650', capacity: 3.5 },
-  { name: '21700', capacity: 5.0 },
-  { name: '26650', capacity: 5.0 },
-  { name: '32700', capacity: 6.0 },
-  { name: 'Pouch', capacity: 10 },
+  { name: '18650', capacity: 3.5, w: 18, h: 65 },
+  { name: '21700', capacity: 5.0, w: 21, h: 70 },
+  { name: '26650', capacity: 5.0, w: 26, h: 65 },
+  { name: '32700', capacity: 6.0, w: 32, h: 70 },
+  { name: 'Pouch', capacity: 10, w: 60, h: 90 },
 ];
 
 const makeCell = (id, x, y, over = {}) => ({
-  id, x, y, voltage: 3.7, capacity: 5, flipped: false, ...over,
+  id, x, y, voltage: 3.7, capacity: 5, ...over,
 });
 
 export default function BatteryPackDesigner() {
@@ -46,6 +57,11 @@ export default function BatteryPackDesigner() {
   const [showBMS, setShowBMS] = useState(true);
   const [summaryModal, setSummaryModal] = useState(false);
   const fileRef = useRef(null);
+
+  // Physical pack dimensions (mm): per-cell footprint + gap between cells.
+  const [cellW, setCellW] = useState(21);
+  const [cellH, setCellH] = useState(70);
+  const [cellGap, setCellGap] = useState(2);
 
   const canvasRef = useRef(null);
   const panRef = useRef(pan);
@@ -93,16 +109,12 @@ export default function BatteryPackDesigner() {
   }, [history]);
 
   // ---- geometry -----------------------------------------------------------
-  const poleSide = (cell, pole) => {
-    const topIsPlus = !cell.flipped;
-    if (pole === '+') return topIsPlus ? 'top' : 'bottom';
-    return topIsPlus ? 'bottom' : 'top';
-  };
+  // + is always the top terminal, − the bottom. (No flip — it was cosmetic and
+  // confusing; orientation never affected the electrical model anyway.)
   const nodePos = (cellId, pole) => {
     const cell = cells.find((c) => c.id === cellId);
     if (!cell) return null;
-    const side = poleSide(cell, pole);
-    const y = side === 'top' ? cell.y - NODE_GAP : cell.y + CELL_H + NODE_GAP;
+    const y = pole === '+' ? cell.y - NODE_GAP : cell.y + CELL_H + NODE_GAP;
     return { x: cell.x + CELL_W / 2, y };
   };
 
@@ -118,14 +130,51 @@ export default function BatteryPackDesigner() {
 
   // ---- cell ops -----------------------------------------------------------
   const addCell = () => {
-    const c = makeCell(nextId, 140 + (cells.length % 6) * 30, 160 + Math.floor(cells.length / 6) * 30);
+    // Drop the new cell into the first free slot of a tidy grid (same spacing as
+    // Create grid), filling left-to-right and reusing gaps from deletions.
+    const SPX = GRID_SX;
+    const SPY = GRID_SY;
+    const COLS = 8;
+    const OX = GRID_OX;
+    const OY = GRID_OY;
+    const occupied = (x, y) => cells.some((c) => Math.abs(c.x - x) < SPX / 2 && Math.abs(c.y - y) < SPY / 2);
+    let x = OX;
+    let y = OY;
+    for (let i = 0; i < 1000; i++) {
+      const gx = OX + (i % COLS) * SPX;
+      const gy = OY + Math.floor(i / COLS) * SPY;
+      if (!occupied(gx, gy)) {
+        x = gx;
+        y = gy;
+        break;
+      }
+    }
+    const c = makeCell(nextId, x, y);
     setNextId(nextId + 1);
     commit([...cells, c], connections);
   };
 
-  const flipSelected = () => {
-    if (!selected.size) return;
-    commit(cells.map((c) => (selected.has(c.id) ? { ...c, flipped: !c.flipped } : c)), connections);
+  // Auto-wire the selected cells in series or parallel, ordered by position
+  // (left→right, top→bottom). Far quicker than dragging each wire by hand.
+  const wireSelected = (mode) => {
+    const chosen = cells.filter((c) => selected.has(c.id));
+    if (chosen.length < 2) return;
+    const ordered = [...chosen].sort((a, b) => Math.round(a.y / 40) - Math.round(b.y / 40) || a.x - b.x);
+    const next = [...connections];
+    const exists = (from, fp, to, tp) =>
+      next.some((c) =>
+        (c.from === from && c.fromPole === fp && c.to === to && c.toPole === tp) ||
+        (c.from === to && c.fromPole === tp && c.to === from && c.toPole === fp));
+    const add = (from, fp, to, tp) => { if (!exists(from, fp, to, tp)) next.push({ from, fromPole: fp, to, toPole: tp }); };
+    for (let i = 1; i < ordered.length; i++) {
+      if (mode === 'series') {
+        add(ordered[i - 1].id, '-', ordered[i].id, '+'); // − → + chains voltage
+      } else {
+        add(ordered[i - 1].id, '+', ordered[i].id, '+'); // + bus
+        add(ordered[i - 1].id, '-', ordered[i].id, '-'); // − bus
+      }
+    }
+    commit(cells, next);
   };
 
   const deleteSelected = useCallback(() => {
@@ -139,6 +188,7 @@ export default function BatteryPackDesigner() {
   const clearAll = () => {
     setSelected(new Set());
     resetView();
+    setNextId(1); // fresh start — next cell is Cell 1 again
     commit([], []);
   };
 
@@ -214,8 +264,8 @@ export default function BatteryPackDesigner() {
 
   // ---- grid (auto-wired into S×P) ----------------------------------------
   const createGrid = () => {
-    const SPX = 95;
-    const SPY = 150;
+    const SPX = GRID_SX;
+    const SPY = GRID_SY;
     const grid = []; // grid[row][col] = id
     const newCells = [];
     let id = 1;
@@ -224,22 +274,21 @@ export default function BatteryPackDesigner() {
       for (let c = 0; c < gridCols; c++) {
         // No flips: + always on top, − on bottom, so series links between rows
         // are short vertical jumps from one array straight to the next.
-        newCells.push(makeCell(id, 50 + c * SPX, 50 + r * SPY));
+        newCells.push(makeCell(id, GRID_OX + c * SPX, GRID_OY + r * SPY));
         grid[r][c] = id;
         id++;
       }
     }
-    // Wire: each row is a parallel group (cols in parallel), rows in series.
+    // Wire each row as a parallel group with a chained bus (cell→neighbour), so
+    // the nickel reads as one continuous strip; rows linked in series.
     const conns = [];
     for (let r = 0; r < gridRows; r++) {
       for (let c = 1; c < gridCols; c++) {
-        conns.push({ from: grid[r][0], fromPole: '+', to: grid[r][c], toPole: '+' });
-        conns.push({ from: grid[r][0], fromPole: '-', to: grid[r][c], toPole: '-' });
+        conns.push({ from: grid[r][c - 1], fromPole: '+', to: grid[r][c], toPole: '+' });
+        conns.push({ from: grid[r][c - 1], fromPole: '-', to: grid[r][c], toPole: '-' });
       }
       if (r > 0) {
-        // Series to the row above: bottom (−) of the upper array → top (+) of
-        // this array. One link is enough — the strip renderer draws the full
-        // shared junction strip across the whole array.
+        // Series: bottom (−) of the upper array → top (+) of this array.
         conns.push({ from: grid[r - 1][0], fromPole: '-', to: grid[r][0], toPole: '+' });
       }
     }
@@ -271,6 +320,27 @@ export default function BatteryPackDesigner() {
     }
     commit(cells, next);
     setDraggingLine(null);
+  };
+
+  // Forgiving release: if a wire-drag ends in open space, snap to the nearest
+  // terminal within reach instead of making the user land exactly on a node.
+  const finishWireAtPointer = () => {
+    if (!draggingLine) return;
+    let best = null;
+    let bestD = 36;
+    cells.forEach((c) => {
+      if (c.id === draggingLine.from) return;
+      ['+', '-'].forEach((pole) => {
+        const p = nodePos(c.id, pole);
+        const d = Math.hypot(p.x - pointer.x, p.y - pointer.y);
+        if (d < bestD) {
+          bestD = d;
+          best = { cellId: c.id, pole };
+        }
+      });
+    });
+    if (best) endWire(best.cellId, best.pole);
+    else setDraggingLine(null);
   };
 
   const removeConnection = (idx) => commit(cells, connections.filter((_, i) => i !== idx));
@@ -311,8 +381,11 @@ export default function BatteryPackDesigner() {
     let totalDx = 0;
     let totalDy = 0;
 
+    // Snap each dragged cell to the nearest grid slot so packs stay aligned.
     const applyDelta = () =>
-      startCells.map((c) => (moveSet.has(c.id) ? { ...c, x: c.x + totalDx, y: c.y + totalDy } : c));
+      startCells.map((c) => (moveSet.has(c.id)
+        ? { ...c, x: snapToGrid(c.x + totalDx, GRID_SX, GRID_OX), y: snapToGrid(c.y + totalDy, GRID_SY, GRID_OY) }
+        : c));
 
     const onMove = (m) => {
       // screen pixels → world units (so drag tracks the cursor at any zoom)
@@ -420,18 +493,14 @@ export default function BatteryPackDesigner() {
 
   const nodeColor = (pole) => (pole === '+' ? '#43a047' : '#e53935');
 
-  // Physical nickel strips: one per electrical net. A strip is a horizontal bar
-  // sitting where the nickel would go, with a short tab welding each cell
-  // terminal to it. A junction strip lands in the gap between arrays; the B+/B−
-  // strips sit along the outer edges.
-  const strips = computeNets(cells, connections)
-    .map((net) => {
-      const pts = net.terminals.map((t) => nodePos(t.cellId, t.pole)).filter(Boolean);
-      if (pts.length < 2) return null;
-      const xs = pts.map((p) => p.x);
-      const ys = pts.map((p) => p.y);
-      const y = (Math.min(...ys) + Math.max(...ys)) / 2;
-      return { x0: Math.min(...xs), x1: Math.max(...xs), y, pts };
+  // Nickel = the actual wires. Each connection is drawn as one strip segment
+  // between the two terminals it really joins — so an unwired gap shows as a
+  // gap, instead of one bar implying a connection that isn't there.
+  const segments = connections
+    .map((cn, idx) => {
+      const a = nodePos(cn.from, cn.fromPole);
+      const b = nodePos(cn.to, cn.toPole);
+      return a && b ? { a, b, idx } : null;
     })
     .filter(Boolean);
 
@@ -440,7 +509,8 @@ export default function BatteryPackDesigner() {
   // series link sitting in the open gap *between* rows — that keeps the tag off
   // the cells. The two pack ends (B−/B+) only have an outer busbar, so their
   // tags get pushed clear of the pack instead.
-  const bmsTaps = showBMS ? computeBMSTaps(cells, connections) : [];
+  // Only show BMS taps for a valid pack — they're meaningless on a broken one.
+  const bmsTaps = showBMS && result.valid ? computeBMSTaps(cells, connections) : [];
   const tapLabel = (i) => (i === 0 ? 'B−' : i === bmsTaps.length - 1 ? 'B+' : `S${i}`);
 
   const packMidY = cells.length
@@ -477,6 +547,12 @@ export default function BatteryPackDesigner() {
     });
   })();
 
+  // Physical pack size, estimated from how many grid columns/rows are occupied.
+  const packCols = cells.length ? new Set(cells.map((c) => Math.round((c.x - GRID_OX) / GRID_SX))).size : 0;
+  const packRows = cells.length ? new Set(cells.map((c) => Math.round((c.y - GRID_OY) / GRID_SY))).size : 0;
+  const packWmm = cells.length ? packCols * cellW + (packCols - 1) * cellGap : 0;
+  const packHmm = cells.length ? packRows * cellH + (packRows - 1) * cellGap : 0;
+
   // Export the diagram as a standalone SVG (vector, prints cleanly).
   const exportSVG = () => {
     if (!cells.length) return;
@@ -491,12 +567,9 @@ export default function BatteryPackDesigner() {
     const oy = (y) => Math.round(y - minY);
     let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family="sans-serif">`;
     s += `<rect width="${W}" height="${H}" fill="#fafafa"/>`;
-    strips.forEach((st) => {
-      st.pts.forEach((p) => {
-        s += `<line x1="${ox(p.x)}" y1="${oy(p.y)}" x2="${ox(p.x)}" y2="${oy(st.y)}" stroke="#90a4ae" stroke-width="5" stroke-linecap="round"/>`;
-      });
-      s += `<line x1="${ox(st.x0 - 8)}" y1="${oy(st.y)}" x2="${ox(st.x1 + 8)}" y2="${oy(st.y)}" stroke="#b0bec5" stroke-width="9" stroke-linecap="round"/>`;
-      s += `<line x1="${ox(st.x0 - 8)}" y1="${oy(st.y)}" x2="${ox(st.x1 + 8)}" y2="${oy(st.y)}" stroke="#78909c" stroke-width="3" stroke-linecap="round"/>`;
+    segments.forEach((seg) => {
+      s += `<line x1="${ox(seg.a.x)}" y1="${oy(seg.a.y)}" x2="${ox(seg.b.x)}" y2="${oy(seg.b.y)}" stroke="#b0bec5" stroke-width="8" stroke-linecap="round"/>`;
+      s += `<line x1="${ox(seg.a.x)}" y1="${oy(seg.a.y)}" x2="${ox(seg.b.x)}" y2="${oy(seg.b.y)}" stroke="#78909c" stroke-width="3" stroke-linecap="round"/>`;
     });
     cells.forEach((c) => {
       const x = ox(c.x);
@@ -552,11 +625,14 @@ export default function BatteryPackDesigner() {
       <div className="toolbar">
         <button className="btn" onClick={addCell}>+ Add cell</button>
         <button className="btn" onClick={() => setGridModal(true)}>⊞ Create grid</button>
-        {selected.size > 0 && (
+        {selected.size >= 2 && (
           <>
-            <button className="btn warn" onClick={flipSelected}>⟲ Flip ({selected.size})</button>
-            <button className="btn danger" onClick={deleteSelected}>🗑 Delete ({selected.size})</button>
+            <button className="btn" style={{ background: '#5e35b1' }} onClick={() => wireSelected('series')} title="Wire selected cells in series">⇢ Series ({selected.size})</button>
+            <button className="btn" style={{ background: '#00897b' }} onClick={() => wireSelected('parallel')} title="Wire selected cells in parallel">⇉ Parallel ({selected.size})</button>
           </>
+        )}
+        {selected.size > 0 && (
+          <button className="btn danger" onClick={deleteSelected}>🗑 Delete ({selected.size})</button>
         )}
         <button className="btn ghost" onClick={clearAll}>Clear</button>
         <button className={`btn ${showBMS ? '' : 'ghost'}`} style={showBMS ? { background: '#8e24aa' } : undefined} onClick={() => setShowBMS((v) => !v)}>
@@ -596,15 +672,18 @@ export default function BatteryPackDesigner() {
             style={{ position: 'absolute', left: 0, top: 0, width: 0, height: 0, transformOrigin: '0 0', transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
           >
             <svg style={{ position: 'absolute', overflow: 'visible', width: 1, height: 1, pointerEvents: 'none' }}>
-              {/* Physical nickel strips: one bar per net, with a tab welding each
-                  cell terminal to it — what you'd actually cut and weld. */}
-              {strips.map((s, idx) => (
-                <g key={`strip-${idx}`}>
-                  {s.pts.map((p, j) => (
-                    <line key={j} x1={p.x} y1={p.y} x2={p.x} y2={s.y} stroke="#90a4ae" strokeWidth="5" strokeLinecap="round" />
-                  ))}
-                  <line x1={s.x0 - 8} y1={s.y} x2={s.x1 + 8} y2={s.y} stroke="#b0bec5" strokeWidth="9" strokeLinecap="round" />
-                  <line x1={s.x0 - 8} y1={s.y} x2={s.x1 + 8} y2={s.y} stroke="#78909c" strokeWidth="3" strokeLinecap="round" />
+              {/* Nickel = the actual wires. Each connection is one segment, so an
+                  unwired gap shows as a gap (no phantom connections). */}
+              {segments.map((s) => (
+                <g key={`seg-${s.idx}`}>
+                  <line x1={s.a.x} y1={s.a.y} x2={s.b.x} y2={s.b.y} stroke="#b0bec5" strokeWidth="8" strokeLinecap="round" />
+                  <line x1={s.a.x} y1={s.a.y} x2={s.b.x} y2={s.b.y} stroke="#78909c" strokeWidth="3" strokeLinecap="round" />
+                  {/* wide invisible hit target: click the wire to delete it */}
+                  <line x1={s.a.x} y1={s.a.y} x2={s.b.x} y2={s.b.y} stroke="transparent" strokeWidth="14"
+                    style={{ pointerEvents: 'stroke', cursor: 'pointer' }}
+                    onClick={() => removeConnection(s.idx)}>
+                    <title>Click to delete this wire</title>
+                  </line>
                 </g>
               ))}
               {draggingLine && (() => {
@@ -616,8 +695,8 @@ export default function BatteryPackDesigner() {
 
             {cells.map((cell) => {
               const isSel = selected.has(cell.id);
-              const topPole = poleSide(cell, '+') === 'top' ? '+' : '-';
-              const botPole = topPole === '+' ? '-' : '+';
+              const topPole = '+';
+              const botPole = '-';
               return (
                 <div key={cell.id} style={{ position: 'absolute', left: cell.x, top: cell.y }}>
                   <div
@@ -713,30 +792,40 @@ export default function BatteryPackDesigner() {
             ) : (
               <>
                 <div className="field">
-                  <label>Chemistry (sets nominal voltage)</label>
-                  <div className="chip-row">
+                  <label>Chemistry</label>
+                  <select
+                    value={CHEMISTRIES.find((c) => c.voltage === selVoltage)?.id || (selVoltage === '' ? '' : 'custom')}
+                    onChange={(e) => {
+                      const ch = CHEMISTRIES.find((c) => c.id === e.target.value);
+                      if (ch) updateSelected({ voltage: ch.voltage });
+                    }}
+                  >
+                    {selVoltage === '' && <option value="">Mixed</option>}
                     {CHEMISTRIES.map((ch) => (
-                      <span key={ch.id} className="chip" onClick={() => updateSelected({ voltage: ch.voltage })}>
-                        {ch.name}
-                      </span>
+                      <option key={ch.id} value={ch.id}>{ch.name} — {ch.voltage}V</option>
                     ))}
-                  </div>
-                </div>
-                <div className="field">
-                  <label>Common cell size (sets capacity)</label>
-                  <div className="chip-row">
-                    {CELL_SIZES.map((s) => (
-                      <span key={s.name} className="chip" onClick={() => updateSelected({ capacity: s.capacity })}>
-                        {s.name}
-                      </span>
-                    ))}
-                  </div>
+                    <option value="custom">Custom…</option>
+                  </select>
                 </div>
                 <div className="field">
                   <label>Voltage (V)</label>
                   <input type="number" step="0.1" min="0" value={selVoltage}
                     placeholder="mixed"
                     onChange={(e) => updateSelected({ voltage: Number(e.target.value) || 0 })} />
+                </div>
+                <div className="field">
+                  <label>Common cell size (sets capacity + dimensions)</label>
+                  <div className="chip-row">
+                    {CELL_SIZES.map((s) => (
+                      <span key={s.name} className="chip" onClick={() => {
+                        updateSelected({ capacity: s.capacity });
+                        setCellW(s.w);
+                        setCellH(s.h);
+                      }}>
+                        {s.name}
+                      </span>
+                    ))}
+                  </div>
                 </div>
                 <div className="field">
                   <label>Capacity (Ah)</label>
@@ -749,15 +838,38 @@ export default function BatteryPackDesigner() {
           </div>
 
           <div className="card">
-            <h3>Wiring check</h3>
-            <ul className="faults">
-              {result.faults.length === 0 && cells.length > 0 && (
-                <li className="fault ok">No wiring faults detected.</li>
-              )}
-              {cells.length === 0 && <li className="fault warn">No cells yet — add one to start.</li>}
-              {errors.map((f, i) => <li key={`e${i}`} className="fault error">⚠ {f.message}</li>)}
-              {warns.map((f, i) => <li key={`w${i}`} className="fault warn">⚠ {f.message}</li>)}
-            </ul>
+            <h3>Pack status</h3>
+            {(() => {
+              if (cells.length === 0) {
+                return <div className="fault warn">No cells yet — add one or create a grid.</div>;
+              }
+              const open = result.faults.filter((f) => f.type === 'open-terminal');
+              const others = result.faults.filter((f) => f.type !== 'open-terminal');
+              const issues = others.length + (open.length ? 1 : 0);
+              if (result.valid) {
+                return (
+                  <div className="fault ok">
+                    ✓ Valid pack — {result.label ? `${result.label}, ` : ''}{result.voltage.toFixed(1)}V / {result.capacity.toFixed(1)}Ah
+                    {!result.label ? ' (irregular layout)' : ''}
+                  </div>
+                );
+              }
+              return (
+                <>
+                  <div className="fault error" style={{ marginBottom: 6 }}>
+                    ⚠ Not a valid pack — {issues} issue{issues === 1 ? '' : 's'} to fix
+                  </div>
+                  <ul className="faults">
+                    {others.map((f, i) => <li key={`o${i}`} className={`fault ${f.severity}`}>{f.message}</li>)}
+                    {open.length > 0 && (
+                      <li className="fault warn">
+                        {open.length} terminal{open.length === 1 ? '' : 's'} unconnected (cells {[...new Set(open.flatMap((f) => f.cellIds))].sort((a, b) => a - b).join(', ')})
+                      </li>
+                    )}
+                  </ul>
+                </>
+              );
+            })()}
           </div>
 
           <div className="card">
@@ -779,6 +891,34 @@ export default function BatteryPackDesigner() {
                   ))}
                 </ul>
               </>
+            )}
+          </div>
+
+          <div className="card">
+            <h3>Pack dimensions</h3>
+            <div className="dim-row">
+              <div className="field">
+                <label>Cell ⌀ (mm)</label>
+                <input type="number" min="0" step="0.5" value={cellW} onChange={(e) => setCellW(Number(e.target.value) || 0)} />
+              </div>
+              <div className="field">
+                <label>Cell len (mm)</label>
+                <input type="number" min="0" step="0.5" value={cellH} onChange={(e) => setCellH(Number(e.target.value) || 0)} />
+              </div>
+              <div className="field">
+                <label>Gap (mm)</label>
+                <input type="number" min="0" step="0.5" value={cellGap} onChange={(e) => setCellGap(Number(e.target.value) || 0)} />
+              </div>
+            </div>
+            {cells.length === 0 ? (
+              <div className="muted">Add cells to estimate size.</div>
+            ) : (
+              <div className="muted">
+                Layout <strong>{packCols} × {packRows}</strong> →{' '}
+                <strong style={{ color: '#1976d2' }}>{Math.round(packWmm)} × {Math.round(packHmm)} mm</strong>
+                {' '}({(packWmm / 25.4).toFixed(1)} × {(packHmm / 25.4).toFixed(1)} in)
+                <br />Pick a cell size above to set ⌀ and length.
+              </div>
             )}
           </div>
         </div>
